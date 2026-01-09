@@ -3,6 +3,7 @@ import shutil
 import time
 import re
 import datetime
+import json
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
 
@@ -28,13 +29,13 @@ from app.modules.jellyfin import Jellyfin
 
 class MediaSyncDel(_PluginBase):
     # 插件名称
-    plugin_name = "媒体文件同步删除2"
+    plugin_name = "媒体文件同步删除"
     # 插件描述
-    plugin_desc = "同步删除历史记录、源文件和下载任务（Win路径+无TMDBID强制删除版）。"
+    plugin_desc = "同步删除历史记录、源文件和下载任务（Win路径修复+无TMDBID强制删除版）。"
     # 插件图标
     plugin_icon = "mediasyncdel.png"
     # 插件版本
-    plugin_version = "2.0.1"
+    plugin_version = "1.9.4.ForceFix"
     # 插件作者
     plugin_author = "thsrite & Gemini"
     # 作者主页
@@ -50,12 +51,12 @@ class MediaSyncDel(_PluginBase):
     _scheduler: Optional[BackgroundScheduler] = None
     _enabled = False
     _sync_type: str = ""
+    _cron: str = ""
     _notify = False
     _del_source = False
     _del_history = False
     _exclude_path = None
     _library_path = None
-    _cron = None
     _transferchain = None
     _transferhis = None
     _downloadhis = None
@@ -107,27 +108,6 @@ class MediaSyncDel(_PluginBase):
                     "library_path": self._library_path
                 })
 
-    # --- 修复核心：补全基类要求的抽象方法 ---
-    def get_state(self) -> bool:
-        """
-        [修复] 必须实现的方法：返回插件运行状态
-        """
-        return self._enabled
-
-    def get_api(self) -> List[Dict[str, Any]]:
-        """
-        [修复] 必须实现的方法：注册API
-        """
-        return [
-            {
-                "path": "/delete_history",
-                "endpoint": self.delete_history,
-                "methods": ["GET"],
-                "summary": "删除订阅历史记录"
-            }
-        ]
-    # --------------------------------------
-
     def _convert_path(self, media_path: str) -> str:
         """
         核心改造：处理 Windows 路径到 WSL 的转换
@@ -167,6 +147,16 @@ class MediaSyncDel(_PluginBase):
     def get_command() -> List[Dict[str, Any]]:
         return []
 
+    def get_api(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "path": "/delete_history",
+                "endpoint": self.delete_history,
+                "methods": ["GET"],
+                "summary": "删除订阅历史记录"
+            }
+        ]
+
     def delete_history(self, key: str, apikey: str):
         if apikey != settings.API_TOKEN:
             return schemas.Response(success=False, message="API密钥错误")
@@ -178,8 +168,10 @@ class MediaSyncDel(_PluginBase):
         return schemas.Response(success=True, message="删除成功")
 
     def get_service(self) -> List[Dict[str, Any]]:
+        """
+        注册插件公共服务
+        """
         if self._enabled and str(self._sync_type) == "log":
-            # 媒体库同步删除日志方式
             if self._cron:
                 return [{
                     "id": "MediaSyncDel",
@@ -221,7 +213,7 @@ class MediaSyncDel(_PluginBase):
                         ]
                     },
                     {'component': 'VRow', 'content': [{'component': 'VCol', 'props': {'cols': 12}, 'content': [{'component': 'VTextarea', 'props': {'model': 'library_path', 'rows': '2', 'label': '媒体库路径映射', 'placeholder': 'F:\\emby:/media/emby (支持Windows盘符)'}}]}]},
-                    {'component': 'VRow', 'content': [{'component': 'VCol', 'props': {'cols': 12}, 'content': [{'component': 'VAlert', 'props': {'type': 'info', 'variant': 'tonal', 'text': '已启用：Windows路径增强 + 无TMDB ID强制删除模式。'}}]}]}
+                    {'component': 'VRow', 'content': [{'component': 'VCol', 'props': {'cols': 12}, 'content': [{'component': 'VAlert', 'props': {'type': 'info', 'variant': 'tonal', 'text': '关于路径映射（转移后文件路径）：emby:/data/A.mp4, moviepilot:/mnt/link/A.mp4。路径映射填/data:/mnt/link。'}}]}]}
                 ]
             }
         ], {
@@ -274,9 +266,8 @@ class MediaSyncDel(_PluginBase):
         if not event_type or str(event_type) not in ['library.deleted', 'ItemDeleted']:
             return
 
-        # 1. 使用新方法转换路径
+        # 1. 转换路径
         media_path = self._convert_path(event_data.item_path)
-        # 兼容windows路径 (双重保险)
         media_path = media_path.replace('\\', '/')
         
         tmdb_id = event_data.tmdb_id
@@ -305,7 +296,7 @@ class MediaSyncDel(_PluginBase):
     @eventmanager.register(EventType.WebhookMessage)
     def sync_del_by_plugin(self, event: Event):
         if not self._enabled or str(self._sync_type) != "plugin": return
-        event_data: schemas.WebhookEventInfo = event.event_data
+        event_data = event.event_data
         if not event_data.event or str(event_data.event) != 'media_del': return
 
         item_isvirtual = event_data.item_isvirtual
@@ -367,6 +358,8 @@ class MediaSyncDel(_PluginBase):
         if not transfer_history:
             logger.info(f"标准查询未找到 {media_name}，尝试使用路径反查: {media_path}")
             transfer_history = self._transferhis.get_by(dest=media_path)
+            if transfer_history:
+                msg = f"路径匹配 {media_name}"
 
         if not transfer_history:
             logger.warn(f"{media_type} {media_name} 未获取到可删除数据，路径：{media_path}")
@@ -383,54 +376,47 @@ class MediaSyncDel(_PluginBase):
         logger.info(f"开始同步删除 {msg}, 匹配到 {len(transfer_history)} 条记录")
         
         # 开始执行删除
-        year = None
         del_torrent_hashs = []
         stop_torrent_hashs = []
         error_cnt = 0
         image = 'https://emby.media/notificationicon.png'
         
         for transferhis in transfer_history:
-            # 路径二次核对 (防止 ID 查错)
+            # 路径二次核对
+            # 修改逻辑：如果路径完全一致，则视为匹配（无视标题差异）；否则再检查标题
             if transferhis.dest != media_path:
-                logger.info(f"记录 {transferhis.dest} 与删除路径 {media_path} 不匹配，跳过")
-                continue
+                title = transferhis.title
+                if title not in media_name:
+                    logger.warn(f"记录 {title} 与删除媒体 {media_name} 标题不符，路径不匹配，跳过")
+                    continue
                 
-            title = transferhis.title
             image = transferhis.image or image
-            year = transferhis.year
 
             # 0. 删除转移记录
             self._transferhis.delete(transferhis.id)
 
             # 1. 删除源文件和种子
             if self._del_source:
-                # 1、直接删除源文件
-                if transferhis.src and Path(transferhis.src).suffix in settings.RMT_MEDIAEXT:
-                    # 删除硬链接文件和源文件
-                    if Path(transferhis.dest).exists():
-                        Path(transferhis.dest).unlink(missing_ok=True)
-                        self.__remove_parent_dir(Path(transferhis.dest))
-                    if Path(transferhis.src).exists():
-                        logger.info(f"源文件 {transferhis.src} 开始删除")
-                        Path(transferhis.src).unlink(missing_ok=True)
-                        logger.info(f"源文件 {transferhis.src} 已删除")
-                        self.__remove_parent_dir(Path(transferhis.src))
+                if transferhis.src:
+                    try:
+                        if Path(transferhis.src).exists():
+                            self._transferchain.delete_files(Path(transferhis.src))
+                            self.__remove_parent_dir(Path(transferhis.src))
+                    except Exception as e:
+                        logger.error(f"源文件删除异常: {e}")
 
                     # 联动下载器删除
                     if transferhis.download_hash:
                         try:
-                            # 2、判断种子是否被删除完
-                            delete_flag, success_flag, handle_torrent_hashs = self.handle_torrent(
+                            flag, success, hashes = self.handle_torrent(
                                 type=transferhis.type,
                                 src=transferhis.src,
                                 torrent_hash=transferhis.download_hash)
-                            if not success_flag:
-                                error_cnt += 1
+                            if success:
+                                if flag: del_torrent_hashs.extend(hashes)
+                                else: stop_torrent_hashs.extend(hashes)
                             else:
-                                if delete_flag:
-                                    del_torrent_hashs += handle_torrent_hashs
-                                else:
-                                    stop_torrent_hashs += handle_torrent_hashs
+                                error_cnt += 1
                         except Exception as e:
                             logger.error("删除种子失败：%s" % str(e))
 
@@ -481,10 +467,10 @@ class MediaSyncDel(_PluginBase):
         history.append({
             "type": media_type_enum.value,
             "title": media_name,
-            "year": year,
+            "year": None, # 简化
             "path": media_path,
-            "season": season_num if season_num and str(season_num).isdigit() else None,
-            "episode": episode_num if episode_num and str(episode_num).isdigit() else None,
+            "season": season_num,
+            "episode": episode_num,
             "image": poster_image,
             "del_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time())),
             "unique": f"{media_name}:{tmdb_id}:{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))}"
@@ -492,9 +478,6 @@ class MediaSyncDel(_PluginBase):
         self.save_data("history", history)
 
     def __remove_parent_dir(self, file_path: Path):
-        """
-        删除父目录
-        """
         if not SystemUtils.exits_files(file_path.parent, settings.RMT_MEDIAEXT):
             i = 0
             for parent_path in file_path.parents:
@@ -508,9 +491,6 @@ class MediaSyncDel(_PluginBase):
 
     def __get_transfer_his(self, media_type: str, media_name: str, media_path: str,
                            tmdb_id: int, season_num: str, episode_num: str):
-        """
-        查询转移记录
-        """
         if season_num and str(season_num).isdigit():
             season_num = str(season_num).rjust(2, '0')
         else: season_num = None
@@ -531,28 +511,16 @@ class MediaSyncDel(_PluginBase):
             if not season_num or not str(season_num).isdigit(): return "", []
             msg = f'剧集 {media_name} S{season_num} {tmdb_id}'
             if tmdb_id and str(tmdb_id).isdigit():
-                transfer_history = self._transferhis.get_by(tmdbid=tmdb_id,
-                                                                                   mtype=mtype.value,
-                                                                                   season=f'S{season_num}')
+                return msg, self._transferhis.get_by(tmdbid=tmdb_id, mtype=mtype.value, season=f'S{season_num}')
             else:
-                transfer_history = self._transferhis.get_by(mtype=mtype.value,
-                                                                                   season=f'S{season_num}',
-                                                                                   dest=media_path)
-            return msg, transfer_history
+                return msg, self._transferhis.get_by(mtype=mtype.value, season=f'S{season_num}', dest=media_path)
         elif mtype == MediaType.TV and season_num and episode_num:
             if not season_num or not episode_num: return "", []
             msg = f'剧集 {media_name} S{season_num}E{episode_num} {tmdb_id}'
-            transfer_history = self._transferhis.get_by(tmdbid=tmdb_id,
-                                                                               mtype=mtype.value,
-                                                                               season=f'S{season_num}',
-                                                                               episode=f'E{episode_num}',
-                                                                               dest=media_path)
-            return msg, transfer_history
-        else:
-            return "", []
+            return msg, self._transferhis.get_by(tmdbid=tmdb_id, mtype=mtype.value, season=f'S{season_num}', episode=f'E{episode_num}', dest=media_path)
+        return "", []
 
     def sync_del_by_log(self):
-        """恢复原版日志扫描功能"""
         history = self.get_data('history') or []
         last_time = self.get_data("last_time") or None
         del_medias = []
@@ -567,7 +535,6 @@ class MediaSyncDel(_PluginBase):
         for del_media in del_medias:
             media_path = self._convert_path(del_media.get("path"))
             media_path = media_path.replace('\\', '/')
-            
             self.__sync_del(media_type=del_media.get("type"),
                             media_name=del_media.get("name"),
                             media_path=media_path,
@@ -578,9 +545,6 @@ class MediaSyncDel(_PluginBase):
         self.save_data("last_time", datetime.datetime.now())
 
     def handle_torrent(self, type: str, src: str, torrent_hash: str):
-        """
-        恢复原版 handle_torrent 复杂逻辑
-        """
         download_id = torrent_hash
         download = self._default_downloader
         history_key = "%s-%s" % (download, torrent_hash)
@@ -644,31 +608,111 @@ class MediaSyncDel(_PluginBase):
             logger.error(f"删种失败： {str(e)}")
             return False, False, 0
 
+    def __del_collection(self, src: str, delete_flag: bool, torrent_hash: str, download_files: list,
+                         handle_torrent_hashs: list):
+        try:
+            src_download_files = self._downloadhis.get_files_by_fullpath(fullpath=src)
+            if src_download_files:
+                for download_file in src_download_files:
+                    if download_file and download_file.download_hash and str(download_file.download_hash) != str(torrent_hash):
+                        hash_download_files = self._downloadhis.get_files_by_hash(download_hash=download_file.download_hash)
+                        if hash_download_files and len(hash_download_files) > len(download_files) and hash_download_files[0].id > download_files[-1].id:
+                            no_del_cnt = 0
+                            for hash_download_file in hash_download_files:
+                                if hash_download_file and hash_download_file.state and int(hash_download_file.state) == 1:
+                                    no_del_cnt += 1
+                            if no_del_cnt > 0: delete_flag = False
+
+                            if delete_flag:
+                                self.chain.remove_torrents(hashs=download_file.download_hash, downloader=download_file.downloader)
+                            else:
+                                self.chain.stop_torrents(hashs=download_file.download_hash, downloader=download_file.downloader)
+                            handle_torrent_hashs.append(download_file.download_hash)
+                            handle_torrent_hashs = self.__del_seed(download_id=download_file.download_hash,
+                                                                   delete_flag=delete_flag,
+                                                                   handle_torrent_hashs=handle_torrent_hashs)
+        except Exception as e:
+            logger.error(f"处理 {torrent_hash} 合集失败: {e}")
+        return handle_torrent_hashs
+
+    def __del_seed(self, download_id, delete_flag, handle_torrent_hashs):
+        history_key = download_id
+        plugin_id = "IYUUAutoSeed"
+        seed_history = self.get_data(key=history_key, plugin_id=plugin_id) or []
+        if seed_history and isinstance(seed_history, list):
+            for history in seed_history:
+                downloader = history.get("downloader")
+                torrents = history.get("torrents")
+                if not downloader or not torrents: return
+                if not isinstance(torrents, list): torrents = [torrents]
+                for torrent in torrents:
+                    handle_torrent_hashs.append(torrent)
+                    if delete_flag:
+                        self.chain.remove_torrents(hashs=torrent, downloader=downloader)
+                    else:
+                        self.chain.stop_torrents(hashs=torrent, downloader=downloader)
+                    handle_torrent_hashs = self.__del_seed(download_id=torrent, delete_flag=delete_flag, handle_torrent_hashs=handle_torrent_hashs)
+            if delete_flag:
+                self.del_data(key=history_key, plugin_id=plugin_id)
+        return handle_torrent_hashs
+
     @staticmethod
     def parse_emby_log(last_time):
-        # 简化日志逻辑，避免引入过多依赖，核心功能依赖Webhook
-        return []
+        def __parse_log(file_name: str, del_list: list):
+            log_url = f"[HOST]System/Logs/{file_name}?api_key=[APIKEY]"
+            log_res = Emby().get_data(log_url)
+            if not log_res or log_res.status_code != 200: return del_list
+            pattern = r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}.\d{3}) Info App: Removing item from database, Type: (\w+), Name: (.*), Path: (.*), Id: (\d+)'
+            matches = re.findall(pattern, log_res.text)
+            for match in matches:
+                mtime = match[0]
+                if last_time and mtime < last_time: continue
+                mtype, name, path = match[1], match[2], match[3]
+                
+                season, episode = None, None
+                if mtype == 'Episode' or mtype == 'Season':
+                    season_match = re.search(r"Season\s*(\d+)", path)
+                    episode_match = re.search(r"S\d+E(\d+)", path)
+                    if season_match: season = f'S{str(season_match.group(1)).rjust(2,"0")}'
+                    if episode_match: episode = f'E{episode_match.group(1)}'
+
+                del_list.append({"time": mtime, "type": mtype, "name": name, "path": path, "season": season, "episode": episode})
+            return del_list
+
+        log_files = []
+        try:
+            log_list_url = "[HOST]System/Logs/Query?Limit=3&api_key=[APIKEY]"
+            log_list_res = Emby().get_data(log_list_url)
+            if log_list_res and log_list_res.status_code == 200:
+                for item in json.loads(log_list_res.text).get("Items", []):
+                    if str(item.get('Name')).startswith("embyserver"):
+                        log_files.append(str(item.get('Name')))
+        except: pass
+        if not log_files: log_files.append("embyserver.txt")
+        
+        del_medias = []
+        for log_file in reversed(log_files):
+            del_medias = __parse_log(log_file, del_medias)
+        return del_medias
 
     @staticmethod
     def parse_jellyfin_log(last_time):
         return []
 
-    @staticmethod
-    def get_tmdbimage_url(path: str, prefix="w500"):
-        if not path: return ""
-        tmdb_image_url = f"https://{settings.TMDB_IMAGE_DOMAIN}"
-        return tmdb_image_url + f"/t/p/{prefix}{path}"
-
-    @staticmethod
-    def format_timestamp(json_data: dict) -> str:
-        from app.utils.string import StringUtils
-        return StringUtils.format_timestamp(
-            StringUtils.str_to_timestamp(
-                json_data.get("UtcTimestamp") or json_data.get("Date")
-            )
-        )
+    def get_state(self):
+        return self._enabled
 
     def stop_service(self):
         try:
             if self._scheduler: self._scheduler.shutdown()
         except: pass
+
+    @staticmethod
+    def get_tmdbimage_url(path: str, prefix="w500"):
+        if not path: return ""
+        return f"https://{settings.TMDB_IMAGE_DOMAIN}/t/p/{prefix}{path}"
+
+    @staticmethod
+    def format_timestamp(json_data: dict) -> str:
+        from app.utils.string import StringUtils
+        return StringUtils.format_timestamp(StringUtils.str_to_timestamp(json_data.get("UtcTimestamp") or json_data.get("Date")))
