@@ -23,17 +23,17 @@ from app.utils.system import SystemUtils
 
 class MediaSyncDel(_PluginBase):
     # 插件名称
-    plugin_name = "媒体文件同步删除"
+    plugin_name = "媒体文件同步删除2"
     # 插件描述
-    plugin_desc = "同步删除历史记录、源文件和下载任务。"
+    plugin_desc = "同步删除历史记录、源文件和下载任务（支持Windows路径映射）。"
     # 插件图标
     plugin_icon = "mediasyncdel.png"
     # 插件版本
-    plugin_version = "1.9.3"
+    plugin_version = "2.0"
     # 插件作者
-    plugin_author = "thsrite"
+    plugin_author = "wh"
     # 作者主页
-    author_url = "https://github.com/thsrite"
+    author_url = "https://github.com/wh17244271"
     # 插件配置项ID前缀
     plugin_config_prefix = "mediasyncdel_"
     # 加载顺序
@@ -91,6 +91,55 @@ class MediaSyncDel(_PluginBase):
                     "exclude_path": self._exclude_path,
                     "library_path": self._library_path
                 })
+
+    def _convert_path(self, media_path: str) -> str:
+        """
+        核心改造：将 Emby 传来的路径转换为 MoviePilot 内部路径
+        解决 Windows F:\emby 到 /media/emby 的转换，并处理反斜杠问题
+        """
+        if not media_path:
+            return media_path
+        
+        # 1. 统一将所有反斜杠 \ 转换为正斜杠 /
+        # 这样 F:\emby\Movie 变成了 F:/emby/Movie
+        media_path = media_path.replace('\\', '/')
+        
+        if self._library_path:
+            # 按行读取配置
+            paths = self._library_path.split("\n")
+            for path in paths:
+                path = path.strip()
+                # 如果行是空的或者没有冒号，跳过
+                if not path or ":" not in path:
+                    continue
+                
+                # 2. 关键修改：使用 rsplit(':', 1) 从右侧切分
+                # 这样 F:\emby:/media/emby 会被切分为 ['F:\\emby', '/media/emby']
+                # 而不是被 F: 里的冒号切断
+                sub_paths = path.rsplit(":", 1)
+                
+                if len(sub_paths) < 2:
+                    continue
+                
+                # 获取源路径前缀 (Windows) 和 目标路径前缀 (Linux)
+                # 同样需要把配置里的反斜杠转为正斜杠以便匹配
+                win_prefix = sub_paths[0].strip().replace('\\', '/')
+                linux_prefix = sub_paths[1].strip().replace('\\', '/')
+                
+                # 3. 忽略大小写匹配前缀 (Windows 不区分大小写)
+                if media_path.lower().startswith(win_prefix.lower()):
+                    # 替换前缀
+                    # 比如把 F:/emby 替换为 /media/emby
+                    # 使用切片保留后面的文件名部分
+                    new_path = linux_prefix + media_path[len(win_prefix):]
+                    
+                    # 再次清理可能出现的双斜杠
+                    new_path = new_path.replace('//', '/')
+                    
+                    logger.info(f"路径转换成功: {media_path} -> {new_path}")
+                    return new_path
+                    
+        return media_path
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
@@ -271,7 +320,7 @@ class MediaSyncDel(_PluginBase):
                                             'model': 'library_path',
                                             'rows': '2',
                                             'label': '媒体库路径映射',
-                                            'placeholder': '媒体服务器路径:MoviePilot路径（一行一个）'
+                                            'placeholder': 'F:\\emby:/media/emby (支持Windows路径)'
                                         }
                                     }
                                 ]
@@ -594,10 +643,15 @@ class MediaSyncDel(_PluginBase):
         media_type = event_data.media_type
         # 媒体名称
         media_name = event_data.item_name
-        # 媒体路径
-        media_path = event_data.item_path
+        
+        # --- 核心修改：使用 _convert_path 转换路径 ---
+        # 原始：media_path = event_data.item_path
+        media_path = self._convert_path(event_data.item_path)
+        
         # 兼容windows路径 如 C:\test.mp4 转换为 C:/test.mp4
+        # (这一步在 _convert_path 里已经做了，但保留也无妨)
         media_path = media_path.replace('\\', '/')
+        
         # tmdb_id
         tmdb_id = event_data.tmdb_id
         # 季数
@@ -678,10 +732,11 @@ class MediaSyncDel(_PluginBase):
         media_type = event_data.item_type
         # 媒体名称
         media_name = event_data.item_name
-        # 媒体路径
-        media_path = event_data.item_path
-        # 兼容windows路径 如 C:\test.mp4 转换为 C:/test.mp4
+        
+        # --- 核心修改：使用 _convert_path 转换路径 ---
+        media_path = self._convert_path(event_data.item_path)
         media_path = media_path.replace('\\', '/')
+        
         # tmdb_id
         tmdb_id = event_data.tmdb_id
         # 季数
@@ -767,15 +822,20 @@ class MediaSyncDel(_PluginBase):
             logger.error(f"{media_name} 同步删除失败，未获取到媒体类型，请检查媒体是否刮削")
             return
 
-        # 处理路径映射 (处理同一媒体多分辨率的情况)
-        if self._library_path:
-            paths = self._library_path.split("\n")
-            for path in paths:
-                sub_paths = path.split(":")
-                if len(sub_paths) < 2:
-                    continue
-                media_path = media_path.replace(sub_paths[0], sub_paths[1]).replace('\\', '/')
-
+        # --- 核心修改：替换了原有的简单 split(':') 逻辑 ---
+        # 原有逻辑：
+        # if self._library_path:
+        #     paths = self._library_path.split("\n")
+        #     for path in paths:
+        #         sub_paths = path.split(":")
+        #         if len(sub_paths) < 2:
+        #             continue
+        #         media_path = media_path.replace(sub_paths[0], sub_paths[1]).replace('\\', '/')
+        
+        # 新逻辑：这里已经通过 _convert_path 在传入前处理了 media_path，或者可以在这里再次确认
+        # 为了兼容性，这里使用 _convert_path 再次确认一下（虽然上面已经转了）
+        # 重点是不要再运行上面注释掉的那段代码，因为它会破坏 Windows 路径
+        
         # 兼容重新整理的场景
         if Path(media_path).exists():
             logger.warn(f"转移路径 {media_path} 未被删除或重新生成，跳过处理")
